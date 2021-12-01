@@ -1,0 +1,431 @@
+---
+title: "Funnel Analysis"
+output:
+  html_document: default
+---
+
+#Background
+
+Our "fake" company has a freemium business model - you can use basic features for free but should pay if need extra features. As the company aims to convert more users from free to premium plans, triggers are shown when users click on blocked features. A similar flow  is initiated if users click directly on Upgrade buttons.
+
+
+```{r setup}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+##libraries needed
+#install.packages("DBI")
+#install.packages("RSQLite")
+#install.packages("tidyverse")
+#install.packages("ggplot2")
+#install.packages("systemfonts")
+#install.packages("forcats")
+
+
+library(DBI)
+library(RSQLite)
+library(tidyverse)
+library(ggplot2)
+library(systemfonts)
+library(forcats)
+```
+
+## 1.Prep data using SQL
+
+SQL (Structured Query Language) is a standardized programming language that's used to manage relational databases and perform various operations on the data in them. It's older than R and Python and being able to use it is one of those technical skills any analyst should own. Usually to query data you would use an external tool, such as a relational database management system (e.g, Oracle DB, MySQL, Microsoft SQL Server). 
+
+In this tutorial we'll use *RSQLite* and *DBI*, 2 packages that allow us to connect to these systems and run queries directly in RStudio. 
+
+
+```{r create db connection}
+con <- dbConnect(RSQLite::SQLite(), dbname = ":memory:")
+```
+
+- accounts.csv: account_id, status ...
+- clicked_locked_feature.csv: user_id, time, locked_feature_name
+- click_upgrade.csv: user_id, time, click_upgrade_from
+- show_inapp_pricing.csv: user_id, time 
+- view_payment_details.csv: user_id, time
+- subscription_created.csv: user_id, time
+
+
+P.s. Remember, if your Rmarkdown file sits where the datasets are, the specifics about the path are not needed when loading them.
+
+```{r load data}
+#load data as tables
+dbWriteTable(con, "clicked_locked", read.csv("Step1.csv"))
+dbWriteTable(con, "click_upgrade", read.csv("Step2.csv"))
+dbWriteTable(con, "show_inapp", read.csv("Step3.csv"))
+dbWriteTable(con, "payment", read.csv("Step4.csv"))
+dbWriteTable(con, "subscription", read.csv("Step5.csv"))
+
+#they are not shown in the environment as if we were to load a csv file as in read.csv
+
+```
+
+Quick exploration: which features are locked and how often are they clicked on
+Have a look at the function formula in help!:
+
+
+```{r explore data locked_feature}
+dbGetQuery(con, 'SELECT count(locked_feature_name) as clicks,locked_feature_name  
+           FROM clicked_locked 
+           GROUP BY locked_feature_name') #add ORDER BY clicks DESC')
+        
+```
+Quick exploration 2: from which triggers (e.g.,message, pop-up, banner) was the "Upgrade button" clicked on and how often
+
+```{r explore data click_upgrade_from}
+dbGetQuery(con, 'SELECT count(click_upgrade_from) as clicks,click_upgrade_from  
+           FROM click_upgrade 
+           GROUP BY click_upgrade_from 
+           ORDER BY clicks DESC') 
+```
+
+
+### Disclaimer:
+
+Between clicked_locked_feature and click_upgrade there are some naming inconsistencies when referring to locked features. DATA IS NOT CLEAN IN THE REAL WORLD. not a 1:1 mapping.
+
+Noted the boring stuff, let's move to the fun part!
+
+## Analize the data with a Funnel analysis
+
+Since this is a **flow process**, the first analysis I'm gonna perform is a funnel analysis. I'm interested in understanding if there are specific drop-off points that hinder the final conversion rate (i.e., creation of premium subscriptions).
+
+```{r using SQL and saving values to create funnel plot in ggplot, error=FALSE}
+
+# I've used user_id||substr(time, 1, 18)) AS a sort of tracking_id to avoid counting rage clicks (user clicks 2-3 times because it takes time to load) that happened within seconds, multiple rendered screens as consequence of rage clicks and delays
+
+#step 1: when a user clicks on CTA Upgrade
+
+clicked_on_CTA_upgrade<-dbGetQuery(con, 'SELECT count(DISTINCT user_id||substr(time, 1, 18)) AS tracking_id 
+                                   FROM click_upgrade')[1,1] # the [1,1] selects the value, check the environment
+
+
+
+#step 2
+shown_pricing<-dbGetQuery(con, 'SELECT count(DISTINCT user_id||substr(time, 1, 18)) AS tracking_id 
+                          FROM show_inapp')[1,1]
+#step 3
+proceeded_to_payment_details<-dbGetQuery(con, 'SELECT count(DISTINCT user_id||substr(time, 1, 18)) AS tracking_id 
+                                         FROM payment')[1,1]
+#step 4
+confirmed_subscription<-dbGetQuery(con, 'SELECT count(DISTINCT user_id||substr(time, 1, 18)) AS tracking_id 
+                                   FROM subscription')[1,1]
+```
+
+```{r create funnel plot}
+#this allows to calculate the % of users who moved through the funnel
+stages <- tibble(
+  clicked_on_upgrade = 1,
+  shown_pricing_opts = round(shown_pricing/clicked_on_CTA_upgrade, digits = 3),
+  selected_plan_and_proceeded_to_payment_details = round(proceeded_to_payment_details/clicked_on_CTA_upgrade, digits = 2),
+  confirmed_subscription = round(confirmed_subscription/clicked_on_CTA_upgrade, digits = 3)
+  
+) %>%
+  gather(stage, percent)
+
+#this allows to create polygons
+to_poly <- stages %>%
+  arrange(percent) %>%
+  mutate(
+    group = row_number(),
+    x1 = 0 + ((1 - percent)/2),
+    x4 = percent + ((1 - percent)/2),
+    x2 = lag(x1), x3 = lag(x4)
+  ) %>%
+  mutate(
+    x2 = ifelse(is.na(x2), x1, x2),
+    x3 = ifelse(is.na(x3), x4, x3)
+    ) %>%
+  gather(xpoint, x, -stage,-group, -percent) %>%
+  arrange(group, xpoint) %>%
+  mutate(y = ifelse(xpoint %in% c("x2", "x3"), group, group + 1))
+
+labels <- stages %>%
+  arrange(percent) %>%
+  mutate(y = row_number() + 0.5)
+
+#plot in ggplot2
+cbPalette <- c( "#455BED", "#1F9575", "#F5C2C0", "#F7C94D")
+funnel<-to_poly %>%
+  ggplot() +
+  geom_polygon(aes(x, y, group = group, fill = stage)) +
+  geom_text(aes(x = 0.5, y = y, label = paste0(percent * 100, "%")), data = labels, size = 5) +
+  scale_y_continuous(breaks = labels$y, labels = c("payment successful", "choose plan & see payment","see in app pricing page", "see trigger & click on Upgrade" )) +
+  theme_minimal() +
+  theme(text=element_text(size=16,  family="sans"),
+    legend.position = "none", 
+    axis.title = element_blank(), 
+    axis.text.x = element_blank(), 
+    axis.ticks.x = element_blank(),
+    panel.background = element_rect(fill = "#F2F2F2", colour = "#F2F2F2"),
+    plot.background = element_rect(fill = "#F2F2F2"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(), 
+    panel.grid.minor.y = element_blank()) +
+  scale_fill_manual(values = cbPalette) 
+print(funnel)
+
+
+```
+
+## Funnel results (see in PPT)
+Looking at the funnel, it seems there are **2 main drop-off points**: 
+
+*   about 80% of the times users *leave after shown pricing* options!
+
+*   once the pricing plan is selected, only 15% (=17/100*15=2.6%) of the times users actually fill-in payment details and finalize the subscription!
+
+Ps. there seem to be a little *loss between clicking on CTA* and *showing pricing page*, which should have happened right after. This is likely do to some rendering issues, due to rage clicks or delays on the client side.
+
+## Features value
+
+The most compelling question that comes to my mind is: *are all locked features seen as bringing the same added value to users using the product?* Which locked features are the most commonly clicked and which ones lead to highest final conversion rates?
+
+Here some data prep to obtain consistent data about naming (comparing data from locked_feature_name to click_upgrade_from).
+
+First: group values related to same features but called inconsistently between the 2 datasets
+
+```{r edit values using update, echo=TRUE}
+#the function is different, this is for executing commands
+
+dbExecute(con,'UPDATE click_upgrade
+                SET click_upgrade_from = "show_over_boards_limit_popup"
+                WHERE click_upgrade_from= "over_boards_limit_banner" OR click_upgrade_from= "over_boards_limit_banner_board" OR
+                click_upgrade_from= "over_boards_limit_popup"')
+
+dbExecute(con,'UPDATE click_upgrade
+                SET click_upgrade_from = "create_template"
+                WHERE click_upgrade_from= "create_teamplate_widget" OR click_upgrade_from= "create_template_board"')
+dbExecute(con,'UPDATE clicked_locked
+                SET locked_feature_name = "create_template"
+                WHERE locked_feature_name= "create_teamplate_widget" OR locked_feature_name= "create_template_board"')
+dbExecute(con,'UPDATE clicked_locked
+                SET locked_feature_name = "custom_template_tip"
+                WHERE locked_feature_name= "custom_template_personal" OR locked_feature_name= "custom_template_team"')
+```
+
+### Follow-up questions
+
+Prep data to calculate Total clicks, Count distinct (unique), Total_clicks_on_UPGRADE.
+
+(See show_over_boards_limit_popup vs jira_addon)
+
+```{r new table about locked features}
+feature_to_upgrade<-dbGetQuery(con,'
+SELECT clicked_locked.locked_feature_name as locked_feature, 
+  COUNT(DISTINCT clicked_locked.user_id||clicked_locked.time) as tot_clicks_on_feature, 
+  COUNT(DISTINCT clicked_locked.user_id) as tot_unique_users, 
+  COUNT(DISTINCT click_upgrade.user_id) as tot_clicks_on_Upgrade 
+  
+FROM clicked_locked 
+LEFT JOIN click_upgrade ON clicked_locked.locked_feature_name = click_upgrade.click_upgrade_from
+GROUP BY clicked_locked.locked_feature_name
+ORDER BY tot_clicks_on_feature DESC
+')
+feature_to_upgrade
+```
+
+### 1. What are the most popular features? -> Tot clicks
+```{r prep plot}
+
+#prep for plot tot clicks
+feature_to_upgrade <- feature_to_upgrade %>% 
+   mutate(perc = paste0(sprintf("%4.1f", tot_clicks_on_feature / sum(tot_clicks_on_feature) * 100), "%"),
+    ## customize label for the first category
+    perc = if_else(row_number() == 1, paste(perc, "of all clicks on LF"), perc),
+    color = case_when(
+      row_number() == 1 ~ "#FFD02F",
+      row_number() == 2 ~ "#1F9575",
+      row_number() == 3 ~ "#F5C2C0",
+      ## all others should be gray
+      TRUE ~ "grey70"
+    )
+  )
+
+
+```
+
+```{r plot tot clicks, message=FALSE, warning=FALSE}
+#total clicks on LF
+#png("LF_tot_clicks.png")
+LF_tot_clicks <- 
+  ggplot(feature_to_upgrade, aes(y=tot_clicks_on_feature, x=reorder(locked_feature, tot_clicks_on_feature), fill=color)) + 
+  geom_bar(position="dodge", stat="identity") +
+  scale_x_discrete(labels = c( "jira addon", "create template","back-up board", "create project","custom template", "over boards limit", "private board" ))+
+  ## make sure labels doesn't get cut
+  scale_y_continuous(limits = c(NA, 13000)) +
+  ## add custom colors
+  scale_fill_identity(guide = "none") +
+  coord_flip()+
+  theme_void() +
+  geom_label(aes(label = perc), ## make labels left-aligned
+  hjust = 1, nudge_x =0, size = 4, fontface = "bold",
+  ## turn into white box without outline
+  fill = "white", label.size = 0) +
+  theme(legend.position = "none", 
+    axis.title = element_blank(), 
+    axis.text.y = element_text(size = 14, hjust = 1),
+    plot.margin = margin(rep(15, 4)), 
+    #axis.ticks.x = element_blank(),
+    panel.background = element_rect(fill = "#F2F2F2", colour = "#F2F2F2"),
+    plot.background = element_rect(fill = "#F2F2F2"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(), 
+    panel.grid.minor.y = element_blank())
+
+print(LF_tot_clicks)
+#dev.off()
+
+```
+
+### 2. What are the most convencing features that push people to keep going? 
+
+```{r prep 2, message=FALSE, warning=FALSE}
+
+feature_to_upgrade$CTR<- feature_to_upgrade$tot_clicks_on_Upgrade/feature_to_upgrade$tot_clicks_on_feature
+
+feature_to_upgrade2 <- feature_to_upgrade %>% 
+  arrange(desc(CTR))%>%
+  mutate(
+    CTR = paste0(sprintf("%4.1f", CTR * 100), "%"),
+    color_CTR = case_when(
+      row_number() == 1 ~ "#FFD02F",
+      row_number() == 2 ~ "#1F9575",
+      row_number() == 3 ~ "#F5C2C0",
+      ## all others should be gray
+      TRUE ~ "grey70"
+    )
+  )
+feature_to_upgrade2
+
+```
+
+```{r CTR plot}
+
+#CTA clicks on LF
+#png("LF_CTA_clicks.png") #initiate to save the plot
+
+order_levels= c("custom_template_tip" ,"Private_board_popup",             "show_over_boards_limit_popup","create_project","jira_addon","backup_board","create_template")
+
+LF_CTA_clicks <- 
+  ggplot(feature_to_upgrade2, aes(y=CTR, x=factor(locked_feature, levels=order_levels), fill=color_CTR)) + 
+    geom_bar(position="dodge", stat="identity") +
+    scale_x_discrete(labels = c( "custom template", "private board","over board limits", "create project","jira addon", "back-up board", "create template" ))+
+  ## make sure labels doesn't get cut
+  ## add custom colors
+  scale_fill_identity(guide = "none") +
+    coord_flip()+
+  theme_void() +
+  geom_label(aes(label = CTR), ## make labels left-aligned
+    hjust = 1, nudge_x =0, size = 4, fontface = "bold", ,
+    ## turn into white box without outline
+    fill = "white", label.size = 0) +
+  theme(legend.position = "none", 
+    axis.title = element_blank(), 
+    axis.text.y = element_text(size = 14, hjust = 1),
+    plot.margin = margin(rep(15, 4)), 
+    #axis.ticks.x = element_blank(),
+    panel.background = element_rect(fill = "#F2F2F2", colour = "#F2F2F2"),
+    plot.background = element_rect(fill = "#F2F2F2"),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.x = element_blank(), 
+    panel.grid.minor.y = element_blank())
+
+print(LF_CTA_clicks)
+#dev.off() #finalize to save the plot
+
+```
+### 3.What are the most successful features that led to buy? CR
+
+Great, many clicks means the feature is highly discoverable, but it doesn't say yet if it's seen as added value to buy a subscription. From Upgrade CTA click to actual user subscription: which features are seen as most valuable?
+
+```{r query}
+upgrade_to_subs<-dbGetQuery(con,'
+  
+  SELECT cu.click_upgrade_from, COUNT(DISTINCT cu.user_id) as tot_clicks_on_Upgrade,
+        COUNT(CASE WHEN (cu.user_id||substr(cu.time, 1, 11) = subscription.user_id||substr(subscription.time, 1,11)) THEN 1 END) as subscribed_same_day 
+        FROM click_upgrade cu 
+        LEFT JOIN subscription ON cu.user_id||substr(cu.time, 1, 11) = subscription.user_id||substr(subscription.time, 1,11)
+        
+        WHERE cu.click_upgrade_from="Private_board_popup" OR 
+          cu.click_upgrade_from="custom_template_tip" OR 
+          cu.click_upgrade_from="show_over_boards_limit_popup" OR
+          cu.click_upgrade_from="create_project" OR
+          cu.click_upgrade_from="backup_board" OR
+          cu.click_upgrade_from="create_template" OR
+          cu.click_upgrade_from="jira_addon"
+        GROUP BY cu.click_upgrade_from
+        ORDER BY subscribed_same_day DESC
+  ')
+  
+```
+
+```{r plot 3, message=FALSE, warning=FALSE}
+upgrade_to_subs$CR<-round(upgrade_to_subs$subscribed_same_day/upgrade_to_subs$tot_clicks_on_Upgrade, digits= 3)
+
+upgrade_to_subs <- upgrade_to_subs %>% 
+  arrange(desc(CR))%>%
+  mutate(
+    CR = paste0(sprintf("%4.1f", CR * 100), "%"),
+    color_CR = case_when(
+      row_number() == 1 ~ "#FFD02F",
+      row_number() == 2 ~ "#1F9575",
+      row_number() == 3 ~ "#F5C2C0",
+      ## all others should be gray
+      TRUE ~ "grey70"
+    )
+  )
+upgrade_to_subs
+
+
+d=data.frame(yintercept=2.6, label="mean upgrade flow CR")
+
+
+order_levels= c("jira_addon" ,"create_template","Private_board_popup", "create_project","custom_template_tip","backup_board","show_over_boards_limit_popup")
+
+
+#png("LF_CR.png")
+LF_CR <- 
+  ggplot(upgrade_to_subs, aes(y=CR, x=factor(click_upgrade_from, levels=order_levels), fill=color_CR)) + 
+    geom_bar(position="dodge", stat="identity") +
+    scale_x_discrete(labels = c(  "jira addon","create project", "private board", "create template", "custom template", "back-up board","over board limits" ))+
+  ## make sure labels doesn't get cut
+  #scale_y_continuous(limits = c(1: 100)) +
+  ## add custom colors
+    scale_fill_identity(guide = "none") +
+    geom_hline(yintercept =2.6, color="#FF653B", linetype= 2, size=1)+
+   #geom_text(data=d, mapping=aes(x=0, y=2.6, label=label), size=4, angle=90, vjust=-0.4, hjust=-0.4) +
+    coord_flip()+
+    theme_void() +
+    geom_label(aes(label = CR), ## make labels left-aligned
+    hjust = 1, nudge_x =0, size = 4, fontface = "bold",
+    ## turn into white box without outline
+    fill = "white", label.size = 0) +
+    theme(legend.position = "none", 
+      axis.title = element_blank(), 
+      axis.text.y = element_text(size = 14, hjust = 1),
+      plot.margin = margin(rep(15, 4)), 
+    #axis.ticks.x = element_blank(),
+      panel.background = element_rect(fill = "#F2F2F2", colour = "#F2F2F2"),
+      plot.background = element_rect(fill = "#F2F2F2"),
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank(), 
+      panel.grid.minor.y = element_blank())
+
+print(LF_CR)
+#dev.off()
+
+
+```
+
+
+```{r}
+# Close the database connection to CarsDB
+dbDisconnect(con)
+```
+
